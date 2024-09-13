@@ -1,6 +1,4 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <math.h>
@@ -11,26 +9,85 @@ void panic(char *message)
     abort();
 }
 
+#define ARENA_DEFAULT_CAP 1024
+
+typedef struct Arena Arena;
+typedef struct Arena
+{
+    size_t cap;
+    size_t used;
+    char *pool;
+    Arena *next;
+} Arena;
+
+inline size_t align(size_t addr, size_t alignment)
+{
+    size_t rem = addr % alignment;
+    if (rem == 0)
+        return addr;
+    else
+        return (addr - rem) + alignment;
+}
+
+Arena *arena_new(size_t cap)
+{
+    cap = align(cap, 8);
+    Arena *arena = malloc(sizeof(Arena));
+    assert(arena != NULL);
+    arena->cap = cap;
+    arena->used = 0;
+    arena->pool = malloc(cap);
+    assert(arena->pool != NULL);
+    arena->next = NULL;
+
+    return arena;
+}
+
+inline Arena *arena_default_new()
+{
+    return arena_new(ARENA_DEFAULT_CAP);
+}
+
+void arena_free(Arena *arena)
+{
+    if (arena->pool != NULL)
+        free(arena->pool);
+    if (arena->next != NULL)
+        arena_free(arena->next);
+
+    free(arena);
+}
+
+void *arena_alloc(Arena *arena, size_t size)
+{
+    assert(arena != NULL);
+
+    size = align(size, 8);
+    if ((arena->used + size) < arena->cap)
+    {
+        void *ptr = arena->pool + arena->used;
+        memset(ptr, 0, size);
+        arena->used += size;
+        return ptr;
+    }
+    else
+    {
+        if (arena->next == NULL)
+        {
+            arena->next = arena_new(arena->cap);
+        }
+        return arena_alloc(arena->next, size);
+    }
+}
+
+Arena *DEFAULT_ARENA = NULL;
+
 void *_new(size_t size)
 {
-    void *ptr = malloc(size);
-    memset(ptr, 0, size);
-    return ptr;
+    return arena_alloc(DEFAULT_ARENA, size);
 }
 
 #define new(T) _new(sizeof(T))
-
-typedef struct
-{
-    bool error;
-    void *value;
-} Result;
-
-#define ErrResult \
-    (Result) { .error = true }
-
-#define OkResult(val) \
-    (Result) { .error = false, .value = val }
 
 #define Array(T)    \
     struct          \
@@ -51,28 +108,19 @@ typedef struct
 
 #define ARRAY_INIT_CAP 10
 
-#define array_append(arr, item)                                      \
-    do                                                               \
-    {                                                                \
-        if ((arr)->cap < (arr)->len + 1)                             \
-        {                                                            \
-            (arr)->cap =                                             \
-                ((arr)->cap == 0) ? ARRAY_INIT_CAP : (arr)->cap * 2; \
-            (arr)->ptr = realloc(                                  \
-                (arr)->ptr, (arr)->cap * sizeof(*(arr)->ptr));       \
-        }                                                            \
-        (arr)->ptr[(arr)->len++] = (item);                           \
-    } while (0)
-
-#define array_free(arr)         \
-    do                          \
-    {                           \
-        if ((arr)->ptr != NULL) \
-        {                       \
-            (arr)->ptr = NULL;  \
-            (arr)->len = 0;     \
-            (arr)->cap = 0;     \
-        }                       \
+#define array_append(arr, item)                                                       \
+    do                                                                                \
+    {                                                                                 \
+        if ((arr)->cap < (arr)->len + 1)                                              \
+        {                                                                             \
+            (arr)->cap =                                                              \
+                ((arr)->cap == 0) ? ARRAY_INIT_CAP : (arr)->cap * 2;                  \
+            void *dst = arena_alloc(DEFAULT_ARENA, (arr)->cap * sizeof(*(arr)->ptr)); \
+            if ((arr)->len > 0)                                                       \
+                memmove(dst, (arr)->ptr, (arr)->len);                                 \
+            (arr)->ptr = dst;                                                         \
+        }                                                                             \
+        (arr)->ptr[(arr)->len++] = (item);                                            \
     } while (0)
 
 typedef Array(char) String;
@@ -107,12 +155,12 @@ typedef struct
 
 typedef String JsonString;
 typedef double JsonNumber;
-typedef Array(JsonValue *) JsonArray;
+typedef Array(JsonValue) JsonArray;
 
 typedef struct
 {
     JsonString *key;
-    JsonValue *value;
+    JsonValue value;
 } JsonObjectProperty;
 
 typedef struct
@@ -120,9 +168,9 @@ typedef struct
     Array(JsonObjectProperty) properties;
 } JsonObject;
 
-void encode_json(FILE *stream, JsonValue *root)
+void encode_json(FILE *stream, JsonValue root)
 {
-    switch (root->type)
+    switch (root.type)
     {
     case JSON_NULL:
     {
@@ -144,20 +192,20 @@ void encode_json(FILE *stream, JsonValue *root)
 
     case JSON_NUMBER:
     {
-        fprintf(stream, "%g", *(double *)root->value);
+        fprintf(stream, "%g", *(double *)root.value);
     }
     break;
 
     case JSON_STRING:
     {
-        JsonString *value = (JsonString *)root->value;
+        JsonString *value = (JsonString *)root.value;
         fprintf(stream, "\"%.*s\"", (int)value->len, value->ptr);
     }
     break;
 
     case JSON_ARRAY:
     {
-        JsonArray *value = (JsonArray *)root->value;
+        JsonArray *value = (JsonArray *)root.value;
         fprintf(stream, "[ ");
         for (size_t i = 0; i < value->len; i++)
         {
@@ -171,13 +219,12 @@ void encode_json(FILE *stream, JsonValue *root)
 
     case JSON_OBJECT:
     {
-        JsonObject *value = (JsonObject *)root->value;
+        JsonObject *value = (JsonObject *)root.value;
         fprintf(stream, "{ ");
         for (size_t i = 0; i < value->properties.len; i++)
         {
             JsonObjectProperty prop = value->properties.ptr[i];
-            JsonString *key = prop.key;
-            fprintf(stream, "\"%.*s\" : ", (int)key->len, key->ptr);
+            fprintf(stream, "\"%.*s\" : ", (int)prop.key->len, prop.key->ptr);
             encode_json(stream, prop.value);
             if (i < value->properties.len - 1)
                 fprintf(stream, ",");
@@ -230,42 +277,54 @@ bool consume_literal(StringView *str, char *literal, size_t literal_size)
     return true;
 }
 
-Result decode_json_value(StringView *str);
+typedef struct
+{
+    bool error;
+    JsonValue value;
+} JsonResult;
 
-Result decode_json_null(StringView *str)
+#define ErrResult \
+    (JsonResult) { .error = true }
+
+#define OkResult(val) \
+    (JsonResult) { .error = false, .value = val }
+
+JsonResult decode_json_value(StringView *str);
+
+JsonResult decode_json_null(StringView *str)
 {
     if (!consume_literal(str, "null", 4))
         return ErrResult;
 
-    JsonValue *json_null = new (JsonValue);
-    json_null->type = JSON_NULL;
+    JsonValue json_null = {0};
+    json_null.type = JSON_NULL;
 
     return OkResult(json_null);
 }
 
-Result decode_json_true(StringView *str)
+JsonResult decode_json_true(StringView *str)
 {
     if (!consume_literal(str, "true", 4))
         return ErrResult;
 
-    JsonValue *json_true = new (JsonValue);
-    json_true->type = JSON_TRUE;
+    JsonValue json_true = {0};
+    json_true.type = JSON_TRUE;
 
     return OkResult(json_true);
 }
 
-Result decode_json_false(StringView *str)
+JsonResult decode_json_false(StringView *str)
 {
     if (!consume_literal(str, "false", 5))
         return ErrResult;
 
-    JsonValue *json_false = new (JsonValue);
-    json_false->type = JSON_FALSE;
+    JsonValue json_false = {0};
+    json_false.type = JSON_FALSE;
 
     return OkResult(json_false);
 }
 
-Result decode_json_number(StringView *str)
+JsonResult decode_json_number(StringView *str)
 {
     bool is_negative = false;
     if (*str->ptr == '-')
@@ -314,14 +373,14 @@ Result decode_json_number(StringView *str)
     JsonNumber *json_num_val = new (JsonNumber);
     *json_num_val = num;
 
-    JsonValue *json_num = new (JsonValue);
-    json_num->type = JSON_NUMBER;
-    json_num->value = json_num_val;
+    JsonValue json_num = {0};
+    json_num.type = JSON_NUMBER;
+    json_num.value = json_num_val;
 
     return OkResult(json_num);
 }
 
-Result decode_json_string(StringView *str)
+JsonResult decode_json_string(StringView *str)
 {
     if (*str->ptr != '\"')
         return ErrResult;
@@ -338,20 +397,21 @@ Result decode_json_string(StringView *str)
             consume_char(str);
             break;
         };
+
         array_append(s, c);
         consume_char(str);
     }
     if (!found_end)
         return ErrResult;
 
-    JsonValue *json_string = new (JsonValue);
-    json_string->type = JSON_STRING;
-    json_string->value = s;
+    JsonValue json_string = {0};
+    json_string.type = JSON_STRING;
+    json_string.value = s;
 
     return OkResult(json_string);
 }
 
-Result decode_json_array(StringView *str)
+JsonResult decode_json_array(StringView *str)
 {
     if (*str->ptr != '[')
         return ErrResult;
@@ -364,7 +424,7 @@ Result decode_json_array(StringView *str)
         if (*str->ptr == ']')
             break;
 
-        Result res = decode_json_value(str);
+        JsonResult res = decode_json_value(str);
         if (res.error)
             return ErrResult;
 
@@ -380,14 +440,14 @@ Result decode_json_array(StringView *str)
         return ErrResult;
     consume_char(str);
 
-    JsonValue *json_arr = new (JsonValue);
-    json_arr->type = JSON_ARRAY;
-    json_arr->value = arr;
+    JsonValue json_arr = {0};
+    json_arr.type = JSON_ARRAY;
+    json_arr.value = arr;
 
     return OkResult(json_arr);
 }
 
-Result decode_json_object(StringView *str)
+JsonResult decode_json_object(StringView *str)
 {
     if (*str->ptr != '{')
         return ErrResult;
@@ -402,12 +462,12 @@ Result decode_json_object(StringView *str)
 
         JsonObjectProperty property = {0};
 
-        Result res = ErrResult;
+        JsonResult res = ErrResult;
         res = decode_json_string(str);
         if (res.error)
             return ErrResult;
 
-        property.key = ((JsonValue*)res.value)->value;
+        property.key = res.value.value;
 
         if (*str->ptr != ':')
             return ErrResult;
@@ -432,14 +492,14 @@ Result decode_json_object(StringView *str)
         return ErrResult;
     consume_char(str);
 
-    JsonValue *jsob_obj = new (JsonValue);
-    jsob_obj->type = JSON_OBJECT;
-    jsob_obj->value = object;
+    JsonValue jsob_obj = {0};
+    jsob_obj.type = JSON_OBJECT;
+    jsob_obj.value = object;
 
     return OkResult(jsob_obj);
 }
 
-Result decode_json_value(StringView *str)
+JsonResult decode_json_value(StringView *str)
 {
     trim_left(str);
 
@@ -504,9 +564,9 @@ Result decode_json_value(StringView *str)
     return ErrResult;
 }
 
-Result decode_json(StringView str)
+JsonResult decode_json(StringView str)
 {
-    Result result = decode_json_value(&str);
+    JsonResult result = decode_json_value(&str);
     if (str.len != 0)
         return ErrResult;
     return result;
@@ -514,12 +574,14 @@ Result decode_json(StringView str)
 
 int main(void)
 {
-    char input[] = "{\"hello\":\"world\"}";
+    DEFAULT_ARENA = arena_default_new();
+    char input[] = "{\"hello\":1.2}";
     StringView view = sv_from_cstr(input, sizeof(input) - 1);
-    Result result = decode_json(view);
+    JsonResult result = decode_json(view);
     if (result.error)
     {
         panic("cannot parse json");
     }
     encode_json(stdout, result.value);
+    arena_free(DEFAULT_ARENA);
 }
